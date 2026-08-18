@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     rw.add_argument("--nli-entailment-threshold", type=float, default=0.50)
     rw.add_argument("--nli-max-contradiction", type=float, default=0.20)
     rw.add_argument("--nli-max-length", type=int, default=512)
+    rw.add_argument("--nli-source-coverage", type=float, default=1.0, help="Fraction of source sentence/claim units that must be entailed by the candidate")
+    rw.add_argument("--nli-candidate-support", type=float, default=1.0, help="Fraction of candidate sentence/claim units that must be entailed by the source")
     rw.add_argument(
         "--no-semantic-gate",
         action="store_true",
@@ -115,6 +117,8 @@ def main():
             nli_entailment_threshold=args.nli_entailment_threshold,
             nli_max_contradiction=args.nli_max_contradiction,
             nli_max_length=args.nli_max_length,
+            nli_source_coverage=args.nli_source_coverage,
+            nli_candidate_support=args.nli_candidate_support,
         )
     elif args.command == "calibrate":
         run_calibration(

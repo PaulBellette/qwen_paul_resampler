@@ -15,7 +15,7 @@ The style score is:
 mean_log_p(Paul-LoRA, candidate) - mean_log_p(base-Qwen, candidate)
 ```
 
-The semantic gate does **not** contribute to the style score. It uses a dedicated bidirectional NLI model, then checks candidates from highest style score downward. The first candidate that is entailed by the source *and* entails the source wins. This implements:
+The semantic gate does **not** contribute to the style score. It uses a dedicated NLI model with sentence/claim coverage checks, then checks candidates from highest style score downward. The first candidate that preserves enough source units without adding unsupported candidate units wins. This implements:
 
 ```text
 argmax style(candidate)
@@ -76,16 +76,16 @@ uv run paul-resampler rewrite \
   --no-semantic-gate
 ```
 
-### Semantic preservation: dedicated NLI gate
+### Semantic preservation: sentence/claim coverage NLI
 
-The generative Qwen model no longer judges its own rewrites. By default the demo loads `cross-encoder/nli-deberta-v3-small` and runs the source/candidate pair in both directions:
+The generative Qwen model no longer judges its own rewrites. By default the demo loads `cross-encoder/nli-deberta-v3-small`, splits source and candidate into sentence-like semantic units, and asks two coverage questions:
 
 ```text
-candidate -> source   # catches dropped source content
-source -> candidate   # catches unsupported additions
+whole candidate -> each source sentence   # did we retain this source claim?
+whole source    -> each candidate sentence # did we invent this candidate claim?
 ```
 
-A candidate passes only when both directions clear the entailment threshold and both stay below the contradiction ceiling. Defaults are deliberately configurable:
+Whole-passage bidirectional NLI is still recorded for diagnostics, but no longer decides the gate: the previous version showed that high lexical overlap could hide a missing claim. By default every source and candidate unit must pass, but the *fraction* required is explicitly configurable so semantic rubberiness can be studied rather than silently baked into the judge:
 
 ```bash
 uv run paul-resampler rewrite \
@@ -94,10 +94,12 @@ uv run paul-resampler rewrite \
   --source source.txt \
   --nli-entailment-threshold 0.50 \
   --nli-max-contradiction 0.20 \
+  --nli-source-coverage 1.0 \
+  --nli-candidate-support 1.0 \
   --out runs/demo.md
 ```
 
-This is still a POC gate rather than a proof of semantic equivalence, especially for long or highly technical passages, but it is independent of the style generator and should reject spectacular topic drift much more reliably than asking the 0.6B model to reason about its own output.
+For a deliberately looser human-ish experiment you can, for example, allow one source sentence in five to be weakly covered with `--nli-source-coverage 0.8`. This is still a POC heuristic rather than a proof of semantic equivalence, especially for long or highly technical passages, but its failures should now be visible at the individual source/candidate sentence level.
 
 ## 3. Calibrate the style scorer
 

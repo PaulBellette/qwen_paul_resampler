@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Replaced whole-passage NLI as the semantic decision rule with sentence/claim coverage NLI.
+- Each source sentence must be entailed by the whole candidate; each candidate sentence must be supported by the whole source.
+- Kept whole-passage bidirectional NLI scores as diagnostics only.
+- Added explicit `--nli-source-coverage` and `--nli-candidate-support` controls so semantic looseness can be tuned rather than hidden.
+- Reports now show per-unit entailment/neutral/contradiction scores and aggregate coverage fractions.
+
 ## 0.4.0
 
 - Replaced the tiny generative semantic judge with a dedicated bidirectional NLI gate.

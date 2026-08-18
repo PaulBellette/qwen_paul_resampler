@@ -56,6 +56,8 @@ class Candidate:
     semantic_raw: str = ""
     semantic_forward_entailment: float | None = None
     semantic_reverse_entailment: float | None = None
+    semantic_source_coverage: float | None = None
+    semantic_candidate_support: float | None = None
 
 
 def realization_messages(source: str, mode_index: int):
@@ -92,6 +94,8 @@ def _check_candidate(
     entailment_threshold: float,
     max_contradiction: float,
     nli_max_length: int,
+    nli_source_coverage: float,
+    nli_candidate_support: float,
 ) -> SemanticCheck:
     check = verify_candidate(
         nli,
@@ -99,6 +103,8 @@ def _check_candidate(
         candidate=candidate.text,
         entailment_threshold=entailment_threshold,
         max_contradiction=max_contradiction,
+        required_source_coverage=nli_source_coverage,
+        required_candidate_support=nli_candidate_support,
         max_length=nli_max_length,
     )
     candidate.semantic_pass = check.passed
@@ -106,6 +112,8 @@ def _check_candidate(
     candidate.semantic_raw = check.raw
     candidate.semantic_forward_entailment = check.forward.entailment
     candidate.semantic_reverse_entailment = check.reverse.entailment
+    candidate.semantic_source_coverage = check.source_coverage
+    candidate.semantic_candidate_support = check.candidate_support
     return check
 
 
@@ -129,6 +137,8 @@ def run_rewrite(
     nli_entailment_threshold: float = 0.50,
     nli_max_contradiction: float = 0.20,
     nli_max_length: int = 512,
+    nli_source_coverage: float = 1.0,
+    nli_candidate_support: float = 1.0,
 ):
     gen_tok, gen_model = load_generator(generator_model_name)
     scorer = load_scorer(base_model_name, adapter_path)
@@ -174,10 +184,12 @@ def run_rewrite(
                 entailment_threshold=nli_entailment_threshold,
                 max_contradiction=nli_max_contradiction,
                 nli_max_length=nli_max_length,
+                nli_source_coverage=nli_source_coverage,
+                nli_candidate_support=nli_candidate_support,
             )
             print(
                 f"semantic candidate {c.index:02d}: {check.verdict} "
-                f"(cand->src={check.forward.entailment:.3f}, src->cand={check.reverse.entailment:.3f})"
+                f"(source coverage={check.source_coverage:.2f}, candidate support={check.candidate_support:.2f})"
             )
             if check.passed:
                 passed = c
@@ -209,6 +221,8 @@ def run_rewrite(
             candidate=null_text,
             entailment_threshold=nli_entailment_threshold,
             max_contradiction=nli_max_contradiction,
+            required_source_coverage=nli_source_coverage,
+            required_candidate_support=nli_candidate_support,
             max_length=nli_max_length,
         )
     source_scores = style_delta_score(scorer, source, max_length=score_max_length)
@@ -227,16 +241,20 @@ def run_rewrite(
     if semantic_gate:
         report.append(
             "## Semantic gate\n\n"
-            f"Bidirectional NLI using `{nli_model_name}`. PASS requires entailment >= "
-            f"`{nli_entailment_threshold:.2f}` in both directions and contradiction <= "
-            f"`{nli_max_contradiction:.2f}` in both directions.\n"
+            f"Sentence/claim coverage NLI using `{nli_model_name}`. Each source sentence is checked "
+            f"against the whole candidate, and each candidate sentence against the whole source. "
+            f"Entailment threshold `{nli_entailment_threshold:.2f}`, contradiction ceiling "
+            f"`{nli_max_contradiction:.2f}`, required source coverage `{nli_source_coverage:.2f}`, "
+            f"candidate support `{nli_candidate_support:.2f}`.\n"
         )
     winner_sem = ""
     if semantic_gate:
         winner_sem = (
             f"  \n**Semantic gate:** `{winner.semantic_verdict}`"
-            f" (candidate→source `{winner.semantic_forward_entailment:.3f}`, "
-            f"source→candidate `{winner.semantic_reverse_entailment:.3f}`)"
+            f" (source coverage `{winner.semantic_source_coverage:.2f}`, "
+            f"candidate support `{winner.semantic_candidate_support:.2f}`; "
+            f"whole cand→src `{winner.semantic_forward_entailment:.3f}`, "
+            f"src→cand `{winner.semantic_reverse_entailment:.3f}`)"
         )
     report.append(
         f"## Winner: resampling ({winner_mode})\n\n"
@@ -250,8 +268,10 @@ def run_rewrite(
     if null_check is not None:
         null_sem = (
             f"  \n**Semantic gate:** `{null_check.verdict}`"
-            f" (candidate→source `{null_check.forward.entailment:.3f}`, "
-            f"source→candidate `{null_check.reverse.entailment:.3f}`)"
+            f" (source coverage `{null_check.source_coverage:.2f}`, "
+            f"candidate support `{null_check.candidate_support:.2f}`; "
+            f"whole cand→src `{null_check.forward.entailment:.3f}`, "
+            f"src→cand `{null_check.reverse.entailment:.3f}`)"
         )
     report.append(
         "## Null: explicit ‘sound like me’ prompt\n\n"
@@ -296,6 +316,8 @@ def run_rewrite(
                     "entailment_threshold": nli_entailment_threshold,
                     "max_contradiction": nli_max_contradiction,
                     "max_length": nli_max_length,
+                    "required_source_coverage": nli_source_coverage,
+                    "required_candidate_support": nli_candidate_support,
                 },
                 "realization_modes": [name for name, _ in REALIZATION_MODES],
                 "winner_mode": winner_mode,
@@ -308,6 +330,10 @@ def run_rewrite(
                         "verdict": null_check.verdict,
                         "forward": asdict(null_check.forward),
                         "reverse": asdict(null_check.reverse),
+                        "source_coverage": null_check.source_coverage,
+                        "candidate_support": null_check.candidate_support,
+                        "source_claims": [asdict(x) for x in null_check.source_claims],
+                        "candidate_claims": [asdict(x) for x in null_check.candidate_claims],
                     },
                 },
                 "candidates": [asdict(c) for c in ranked],

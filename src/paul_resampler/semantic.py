@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -24,21 +25,66 @@ class SemanticCheck:
     verdict: str
     forward: DirectionalNLI
     reverse: DirectionalNLI
+    source_claims: list[DirectionalNLI]
+    candidate_claims: list[DirectionalNLI]
     threshold: float
     max_contradiction: float
+    required_source_coverage: float
+    required_candidate_support: float
+
+    @staticmethod
+    def _ok(score: DirectionalNLI, threshold: float, max_contradiction: float) -> bool:
+        return score.entailment >= threshold and score.contradiction <= max_contradiction
+
+    @property
+    def source_coverage(self) -> float:
+        if not self.source_claims:
+            return 1.0
+        return sum(self._ok(x, self.threshold, self.max_contradiction) for x in self.source_claims) / len(self.source_claims)
+
+    @property
+    def candidate_support(self) -> float:
+        if not self.candidate_claims:
+            return 1.0
+        return sum(self._ok(x, self.threshold, self.max_contradiction) for x in self.candidate_claims) / len(self.candidate_claims)
 
     @property
     def raw(self) -> str:
-        return (
-            "Bidirectional NLI semantic gate\n"
-            f"candidate -> source: entail={self.forward.entailment:.4f}, "
-            f"neutral={self.forward.neutral:.4f}, contradiction={self.forward.contradiction:.4f}\n"
-            f"source -> candidate: entail={self.reverse.entailment:.4f}, "
-            f"neutral={self.reverse.neutral:.4f}, contradiction={self.reverse.contradiction:.4f}\n"
-            f"thresholds: entailment>={self.threshold:.3f}, "
-            f"contradiction<={self.max_contradiction:.3f}\n"
-            f"VERDICT: {self.verdict}"
-        )
+        lines = [
+            "Sentence/claim coverage NLI semantic gate",
+            (
+                f"whole candidate -> source: entail={self.forward.entailment:.4f}, "
+                f"neutral={self.forward.neutral:.4f}, contradiction={self.forward.contradiction:.4f}"
+            ),
+            (
+                f"whole source -> candidate: entail={self.reverse.entailment:.4f}, "
+                f"neutral={self.reverse.neutral:.4f}, contradiction={self.reverse.contradiction:.4f}"
+            ),
+            "",
+            f"SOURCE CLAIM COVERAGE: {self.source_coverage:.3f} (required {self.required_source_coverage:.3f})",
+        ]
+        for i, x in enumerate(self.source_claims, 1):
+            ok = "PASS" if self._ok(x, self.threshold, self.max_contradiction) else "FAIL"
+            lines.append(
+                f"  S{i} {ok}: entail={x.entailment:.4f}, neutral={x.neutral:.4f}, "
+                f"contradiction={x.contradiction:.4f} :: {x.hypothesis}"
+            )
+        lines.extend([
+            "",
+            f"CANDIDATE CLAIM SUPPORT: {self.candidate_support:.3f} (required {self.required_candidate_support:.3f})",
+        ])
+        for i, x in enumerate(self.candidate_claims, 1):
+            ok = "PASS" if self._ok(x, self.threshold, self.max_contradiction) else "FAIL"
+            lines.append(
+                f"  C{i} {ok}: entail={x.entailment:.4f}, neutral={x.neutral:.4f}, "
+                f"contradiction={x.contradiction:.4f} :: {x.hypothesis}"
+            )
+        lines.extend([
+            "",
+            f"thresholds: entailment>={self.threshold:.3f}, contradiction<={self.max_contradiction:.3f}",
+            f"VERDICT: {self.verdict}",
+        ])
+        return "\n".join(lines)
 
 
 @dataclass
@@ -49,6 +95,24 @@ class LoadedNLI:
     entailment_id: int
     neutral_id: int
     contradiction_id: int
+
+
+def split_semantic_units(text: str) -> list[str]:
+    """Cheap sentence-ish segmentation for coverage checks.
+
+    Deliberately avoids an NLP dependency. Newlines are treated as boundaries and
+    ordinary sentence punctuation is split when followed by a plausible sentence
+    start. This is a coverage heuristic, not a claim parser.
+    """
+    text = re.sub(r"\s*\n+\s*", "\n", text.strip())
+    units: list[str] = []
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        parts = re.split(r'(?<=[.!?])\s+(?=["\'\(\[]?[A-Z0-9])', para)
+        units.extend(p.strip() for p in parts if p.strip())
+    return units or ([text.strip()] if text.strip() else [])
 
 
 def _resolve_label_id(model, wanted: str) -> int:
@@ -104,24 +168,27 @@ def directional_nli(nli: LoadedNLI, premise: str, hypothesis: str, *, max_length
 
 
 def semantic_decision(
-    forward: DirectionalNLI,
-    reverse: DirectionalNLI,
+    source_claims: list[DirectionalNLI],
+    candidate_claims: list[DirectionalNLI],
     *,
     entailment_threshold: float = 0.50,
     max_contradiction: float = 0.20,
+    required_source_coverage: float = 1.0,
+    required_candidate_support: float = 1.0,
 ) -> bool:
-    """Require approximate equivalence rather than one-way implication.
+    """Coverage-based equivalence test.
 
-    candidate -> source penalizes dropped content; source -> candidate penalizes
-    substantive additions. The contradiction ceiling catches direct reversals
-    even when entailment calibration is imperfect.
+    Each source sentence must be entailed by the *whole candidate* (retention),
+    and each candidate sentence must be entailed by the *whole source* (no
+    unsupported additions). Fractions are tunable so semantic rubberiness can be
+    studied explicitly instead of hidden in one whole-passage similarity score.
     """
-    return (
-        forward.entailment >= entailment_threshold
-        and reverse.entailment >= entailment_threshold
-        and forward.contradiction <= max_contradiction
-        and reverse.contradiction <= max_contradiction
-    )
+    def ok(x: DirectionalNLI) -> bool:
+        return x.entailment >= entailment_threshold and x.contradiction <= max_contradiction
+
+    source_fraction = 1.0 if not source_claims else sum(ok(x) for x in source_claims) / len(source_claims)
+    candidate_fraction = 1.0 if not candidate_claims else sum(ok(x) for x in candidate_claims) / len(candidate_claims)
+    return source_fraction >= required_source_coverage and candidate_fraction >= required_candidate_support
 
 
 def verify_candidate(
@@ -131,23 +198,40 @@ def verify_candidate(
     candidate: str,
     entailment_threshold: float = 0.50,
     max_contradiction: float = 0.20,
+    required_source_coverage: float = 1.0,
+    required_candidate_support: float = 1.0,
     max_length: int = 512,
 ) -> SemanticCheck:
-    # If candidate entails source, the candidate has retained the source claims.
+    # Keep whole-passage NLI for diagnostics, but do not use its entailment score
+    # as the gate: high lexical overlap can hide a missing claim.
     forward = directional_nli(nli, candidate, source, max_length=max_length)
-    # If source entails candidate, the candidate has not added unsupported claims.
     reverse = directional_nli(nli, source, candidate, max_length=max_length)
+
+    source_units = split_semantic_units(source)
+    candidate_units = split_semantic_units(candidate)
+
+    # Whole candidate -> each source unit: did the rewrite retain every source claim?
+    source_claims = [directional_nli(nli, candidate, unit, max_length=max_length) for unit in source_units]
+    # Whole source -> each candidate unit: did the rewrite invent anything unsupported?
+    candidate_claims = [directional_nli(nli, source, unit, max_length=max_length) for unit in candidate_units]
+
     passed = semantic_decision(
-        forward,
-        reverse,
+        source_claims,
+        candidate_claims,
         entailment_threshold=entailment_threshold,
         max_contradiction=max_contradiction,
+        required_source_coverage=required_source_coverage,
+        required_candidate_support=required_candidate_support,
     )
     return SemanticCheck(
         passed=passed,
         verdict="PASS" if passed else "FAIL",
         forward=forward,
         reverse=reverse,
+        source_claims=source_claims,
+        candidate_claims=candidate_claims,
         threshold=entailment_threshold,
         max_contradiction=max_contradiction,
+        required_source_coverage=required_source_coverage,
+        required_candidate_support=required_candidate_support,
     )
