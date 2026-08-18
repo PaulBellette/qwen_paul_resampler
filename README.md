@@ -2,20 +2,27 @@
 
 A deliberately small proof-of-concept for the hypothesis:
 
-> A pretrained LM already contains the ingredients of a person's writing style; style transfer can be treated partly as **selection among semantically similar realizations**, rather than only as direct prompting.
+> A pretrained LM already contains the ingredients of a person's writing style; style transfer can be treated partly as **selection among semantically equivalent realizations**, rather than only as direct prompting.
 
 This demo compares two conditions using Qwen3-0.6B:
 
 1. **Prompting null:** show the model examples of your writing and ask it to “sound like me”.
-2. **Resampling:** give Qwen only a weak rewrite prompt, sample N rewrites, and pick the candidate with the largest personal-style likelihood-ratio score.
+2. **Resampling:** tell Qwen to express the same content *from scratch*, sample many realizations, rank them with a personal-style likelihood ratio, and take the highest-ranked candidate that passes a separate claim-preservation gate.
 
-The score is:
+The style score is:
 
 ```text
 mean_log_p(Paul-LoRA, candidate) - mean_log_p(base-Qwen, candidate)
 ```
 
-Because every candidate expresses the same source content, topic is mostly held constant while the scorer chooses among surface realizations.
+The semantic gate does **not** contribute to the style score. It uses a dedicated bidirectional NLI model, then checks candidates from highest style score downward. The first candidate that is entailed by the source *and* entails the source wins. This implements:
+
+```text
+argmax style(candidate)
+subject to meaning(candidate) ~= meaning(source)
+```
+
+without spending semantic-judge calls on candidates that cannot possibly win.
 
 ## Setup
 
@@ -49,31 +56,104 @@ uv run paul-resampler rewrite \
   --corpus corpus \
   --adapter adapters/paul \
   --source source.txt \
-  -n 16 \
   --out runs/demo.md
 ```
 
+The rewrite path defaults to 32 candidates at temperature 1.05 / top-p 0.95. Candidates are distributed round-robin across four generic realization modes: conversational, informal discussion, reconstruct-from-memory, and compressed/rebuilt. None mentions Paul or sees Paul examples.
+
 The command writes:
 
-- `runs/demo.md` — source, winning resample, explicit prompting null, and all ranked candidates.
-- `runs/demo.json` — machine-readable scores and outputs.
+- `runs/demo.md` — source, candidate-search modes, NLI-gated winner, explicit prompting null, all ranked candidates, and directional semantic-check details for candidates that had to be tested.
+- `runs/demo.json` — machine-readable scores, claims, checks, outputs, and config.
+
+To reproduce the old pure style-reranking behavior:
+
+```bash
+uv run paul-resampler rewrite \
+  --corpus corpus \
+  --adapter adapters/paul \
+  --source source.txt \
+  --no-semantic-gate
+```
+
+### Semantic preservation: dedicated NLI gate
+
+The generative Qwen model no longer judges its own rewrites. By default the demo loads `cross-encoder/nli-deberta-v3-small` and runs the source/candidate pair in both directions:
+
+```text
+candidate -> source   # catches dropped source content
+source -> candidate   # catches unsupported additions
+```
+
+A candidate passes only when both directions clear the entailment threshold and both stay below the contradiction ceiling. Defaults are deliberately configurable:
+
+```bash
+uv run paul-resampler rewrite \
+  --corpus corpus \
+  --adapter adapters/paul \
+  --source source.txt \
+  --nli-entailment-threshold 0.50 \
+  --nli-max-contradiction 0.20 \
+  --out runs/demo.md
+```
+
+This is still a POC gate rather than a proof of semantic equivalence, especially for long or highly technical passages, but it is independent of the style generator and should reject spectacular topic drift much more reliably than asking the 0.6B model to reason about its own output.
+
+## 3. Calibrate the style scorer
+
+The first run showed the LoRA could assign very different style deltas, but blog topic and style are entangled. Check whether the scalar score actually discriminates your writing:
+
+```bash
+uv run paul-resampler calibrate \
+  --paul-corpus corpus_heldout \
+  --generic-corpus generic_corpus \
+  --adapter adapters/paul \
+  --out runs/calibration.md
+```
+
+**Use Paul text that was not used to train the adapter** if you want this to be more than an overfitting sanity check. A simple way is to reserve whole old posts before retraining.
+
+Calibration now partitions each document into deterministic, **non-overlapping ~200-token chunks**. It does not resample or duplicate a short document to manufacture a requested `N`. The report includes:
+
+- document, chunk, and unique-chunk counts for each group;
+- chunk score distributions and a chunk-level pairwise AUC;
+- the separation margin `min(Paul) - max(generic)`;
+- per-document mean scores;
+- document-level AUC only when there are at least two documents in each group.
+
+The chunk AUC is descriptive: chunks from the same post are correlated, so 20 chunks from one post are not 20 independent examples of an author. With one held-out Paul post and one Kristian post, the per-document means are the honest headline and any chunk-level separation is a useful smoke test rather than a population estimate.
+
+You can change the target chunk size or cap work without replacement:
+
+```bash
+uv run paul-resampler calibrate \
+  --paul-corpus corpus_heldout \
+  --generic-corpus generic_corpus \
+  --adapter adapters/paul \
+  --chunk-tokens 200 \
+  --max-chunks-per-group 100 \
+  --out runs/calibration.md
+```
+
+The raw chunk texts, document names, token counts, and scores are retained in JSON.
 
 ## What would count as interesting?
 
-The key comparison is not whether the winner “sounds good”. It is whether the resampling condition consistently beats the prompting null in blind human judgement.
+There are now three separate questions:
 
-A useful next experiment is to take 20–50 source responses and, without looking at the method labels, choose:
+1. **Does the scorer discriminate?** Held-out Paul text should tend to have higher style delta than generic text.
+2. **Does broader generation expose useful stylistic variation?** The 32 candidates should span more than tiny synonym substitutions.
+3. **Can selection recover style without content drift?** The semantic-gated resampling winner should beat the explicit “sound like me” null in blind judgement while preserving the source claims.
 
-- which output sounds more like you;
-- which better preserves the source meaning;
-- whether either is objectionably mannered.
+The most informative failure modes are also useful:
 
-If resampling wins on style while preserving meaning, the scorer is finding useful structure that the direct prompt is not exploiting.
+- **Null high style / semantic FAIL:** direct prompting is retrieving Paul-ish subject matter rather than merely style.
+- **Human-best candidate exists but scorer ranks it badly:** the generator contains the style but the likelihood-ratio scorer is poor.
+- **All candidates sound alike:** generation is not exploring enough of the semantic equivalence class.
+- **High-style candidates systematically fail semantics:** the scorer is still exploiting topic/content correlations.
 
 ## Important confound
 
-The LoRA likelihood ratio can learn **subject matter** as well as style. Comparing candidates for the *same source* reduces this substantially, because all candidates discuss the same thing, but it does not eliminate it. A later version should hold out topics or train/evaluate across distinct domains.
+The LoRA likelihood ratio can learn **subject matter** as well as style. Comparing candidates for the *same source* reduces this because candidate content is mostly held constant; the semantic gate further constrains content drift. It does not make the score magically style-only.
 
-## Why no automated semantic judge in v0?
-
-A 0.6B model judging subtle semantic preservation is likely to add more noise than insight. For a POC, retain every candidate and inspect the ranked list. Once the style effect is real, add a stronger semantic gate or claim-level verifier.
+That confound is part of the experiment: old blog posts are a fairly hostile corpus because personal subject matter, vocabulary, and surface style are naturally entangled.

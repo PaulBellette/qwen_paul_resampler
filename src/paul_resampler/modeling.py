@@ -123,6 +123,7 @@ def generate_text(
     top_p: float = 0.92,
     max_new_tokens: int = 500,
     seed: int | None = None,
+    do_sample: bool = True,
 ) -> str:
     if seed is not None:
         torch.manual_seed(seed)
@@ -134,16 +135,17 @@ def generate_text(
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "do_sample": do_sample,
+    }
+    if do_sample:
+        generation_kwargs.update(temperature=temperature, top_p=top_p)
+
     with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        output = model.generate(**inputs, **generation_kwargs)
 
     generated = output[0, inputs["input_ids"].shape[1] :]
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
