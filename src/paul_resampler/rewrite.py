@@ -117,6 +117,97 @@ def _check_candidate(
     return check
 
 
+
+@dataclass
+class ResampleResult:
+    winner: Candidate
+    ranked: list[Candidate]
+    winner_mode: str
+
+
+def resample_with_loaded_models(
+    *,
+    source: str,
+    gen_tok,
+    gen_model,
+    scorer,
+    nli: LoadedNLI | None,
+    n: int = 32,
+    temperature: float = 1.05,
+    top_p: float = 0.95,
+    max_new_tokens: int = 500,
+    score_max_length: int = 1024,
+    seed: int = 1234,
+    semantic_gate: bool = True,
+    nli_entailment_threshold: float = 0.50,
+    nli_max_contradiction: float = 0.20,
+    nli_max_length: int = 512,
+    nli_source_coverage: float = 1.0,
+    nli_candidate_support: float = 1.0,
+) -> ResampleResult:
+    """Generate/rank/select without any knowledge of watermark state.
+
+    This is deliberately the same path used by the normal rewrite command.
+    Watermark experiments pass only source text into this function; detector
+    keys/scores never enter candidate generation or selection.
+    """
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+    for i in range(n):
+        mode, messages = realization_messages(source, i)
+        text = generate_text(
+            gen_tok,
+            gen_model,
+            messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            seed=seed + i,
+        )
+        if text in seen:
+            continue
+        seen.add(text)
+        scores = style_delta_score(scorer, text, max_length=score_max_length)
+        candidates.append(Candidate(index=i, mode=mode, text=text, **scores))
+        print(f"candidate {i:02d} [{mode}]: style_delta={scores['style_delta']:+.4f}")
+
+    if not candidates:
+        raise RuntimeError("No candidates were generated")
+    ranked = sorted(candidates, key=lambda c: c.style_delta, reverse=True)
+
+    winner = ranked[0]
+    winner_mode = "style-only"
+    if semantic_gate:
+        if nli is None:
+            raise ValueError("semantic_gate=True requires a loaded NLI model")
+        winner_mode = "semantic-gated"
+        passed = None
+        for c in ranked:
+            check = _check_candidate(
+                nli,
+                source,
+                c,
+                entailment_threshold=nli_entailment_threshold,
+                max_contradiction=nli_max_contradiction,
+                nli_max_length=nli_max_length,
+                nli_source_coverage=nli_source_coverage,
+                nli_candidate_support=nli_candidate_support,
+            )
+            print(
+                f"semantic candidate {c.index:02d}: {check.verdict} "
+                f"(source coverage={check.source_coverage:.2f}, candidate support={check.candidate_support:.2f})"
+            )
+            if check.passed:
+                passed = c
+                break
+        if passed is not None:
+            winner = passed
+        else:
+            winner_mode = "fallback-no-semantic-pass"
+            print("WARNING: no candidate passed the semantic gate; falling back to top style score")
+
+    return ResampleResult(winner=winner, ranked=ranked, winner_mode=winner_mode)
+
 def run_rewrite(
     *,
     source: str,
@@ -144,61 +235,28 @@ def run_rewrite(
     scorer = load_scorer(base_model_name, adapter_path)
     nli = load_nli(nli_model_name, device=nli_device) if semantic_gate else None
 
-    candidates: list[Candidate] = []
-    seen: set[str] = set()
-    for i in range(n):
-        mode, messages = realization_messages(source, i)
-        text = generate_text(
-            gen_tok,
-            gen_model,
-            messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_new_tokens=max_new_tokens,
-            seed=seed + i,
-        )
-        if text in seen:
-            continue
-        seen.add(text)
-        scores = style_delta_score(scorer, text, max_length=score_max_length)
-        candidates.append(Candidate(index=i, mode=mode, text=text, **scores))
-        print(f"candidate {i:02d} [{mode}]: style_delta={scores['style_delta']:+.4f}")
-
-    if not candidates:
-        raise RuntimeError("No candidates were generated")
-    ranked = sorted(candidates, key=lambda c: c.style_delta, reverse=True)
-
-    # Constrained optimization: style-rank first, then spend semantic checks only
-    # until the highest-ranked feasible candidate is found.
-    winner = ranked[0]
-    winner_mode = "style-only"
-    if semantic_gate:
-        assert nli is not None
-        winner_mode = "semantic-gated"
-        passed = None
-        for c in ranked:
-            check = _check_candidate(
-                nli,
-                source,
-                c,
-                entailment_threshold=nli_entailment_threshold,
-                max_contradiction=nli_max_contradiction,
-                nli_max_length=nli_max_length,
-                nli_source_coverage=nli_source_coverage,
-                nli_candidate_support=nli_candidate_support,
-            )
-            print(
-                f"semantic candidate {c.index:02d}: {check.verdict} "
-                f"(source coverage={check.source_coverage:.2f}, candidate support={check.candidate_support:.2f})"
-            )
-            if check.passed:
-                passed = c
-                break
-        if passed is not None:
-            winner = passed
-        else:
-            winner_mode = "fallback-no-semantic-pass"
-            print("WARNING: no candidate passed the semantic gate; falling back to top style score")
+    resampled = resample_with_loaded_models(
+        source=source,
+        gen_tok=gen_tok,
+        gen_model=gen_model,
+        scorer=scorer,
+        nli=nli,
+        n=n,
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        score_max_length=score_max_length,
+        seed=seed,
+        semantic_gate=semantic_gate,
+        nli_entailment_threshold=nli_entailment_threshold,
+        nli_max_contradiction=nli_max_contradiction,
+        nli_max_length=nli_max_length,
+        nli_source_coverage=nli_source_coverage,
+        nli_candidate_support=nli_candidate_support,
+    )
+    winner = resampled.winner
+    ranked = resampled.ranked
+    winner_mode = resampled.winner_mode
 
     docs = read_corpus(corpus_path)
     excerpts = sample_style_excerpts(docs, seed=seed)
@@ -341,7 +399,7 @@ def run_rewrite(
                     "generator_model": generator_model_name,
                     "base_model": base_model_name,
                     "n_requested": n,
-                    "n_unique": len(candidates),
+                    "n_unique": len(ranked),
                     "temperature": temperature,
                     "top_p": top_p,
                     "seed": seed,

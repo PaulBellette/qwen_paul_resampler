@@ -159,3 +159,123 @@ The most informative failure modes are also useful:
 The LoRA likelihood ratio can learn **subject matter** as well as style. Comparing candidates for the *same source* reduces this because candidate content is mostly held constant; the semantic gate further constrains content drift. It does not make the score magically style-only.
 
 That confound is part of the experiment: old blog posts are a fairly hostile corpus because personal subject matter, vocabulary, and surface style are naturally entangled.
+
+## 4. Watermark robustness experiment
+
+This layer was added **after** the personal resampler. It deliberately keeps watermark generation/detection outside the resampling API so the transformation cannot adapt to the watermark key or score.
+
+The first target is the open SynthID Text implementation shipped in Hugging Face Transformers. We use Transformers for watermark generation and for computing SynthID g-values, then reproduce the simple **Mean / Weighted Mean** detector statistic from Google DeepMind's reference implementation. The weighted score uses linearly decreasing watermark-depth weights from 10 to 1. This is a research statistic, **not** a calibrated yes/no provenance threshold.
+
+### Phase A — generate and freeze source texts
+
+Start with the included prompt set or copy it and edit it:
+
+```bash
+cp experiments/prompts.example.jsonl experiments/prompts.jsonl
+
+uv run paul-resampler watermark-generate \
+  --prompts experiments/prompts.jsonl \
+  --out runs/watermark_sources.jsonl
+```
+
+For every prompt this generates a controlled pair from the same Qwen model and RNG seed:
+
+```text
+prompt
+  ├── plain Qwen output
+  └── Qwen + SynthID output
+```
+
+The JSONL records the prompt, texts, generation settings, SynthID configuration, and detector scores. **Freeze this file once generated.** The command refuses to overwrite an existing source file unless `--overwrite` is passed deliberately. Do not regenerate it while tuning the downstream resampler; otherwise it is easy to select lucky/unlucky watermark instances by accident.
+
+The default public SynthID keys use the 30-key configuration published in Google DeepMind's reference implementation. They are intentionally not secret: this experiment asks about incidental robustness under a watermark-blind transformation, not production security.
+
+### Phase B — transform without watermark feedback
+
+```bash
+uv run paul-resampler watermark-test \
+  --inputs runs/watermark_sources.jsonl \
+  --adapter adapters/paul \
+  --out runs/watermark_benchmark.md
+```
+
+For each frozen **watermarked** source the benchmark runs two transformations:
+
+```text
+watermarked source
+  ├── generic semantic-preserving paraphrase
+  └── existing Paul resampler (style rank + NLI gate)
+```
+
+Only after each transformation is complete does the benchmark measure the SynthID detector statistic again. The resampler function receives the source text, generator, style scorer and semantic gate; it receives **no watermark configuration, keys, score, or detector callback**.
+
+The generic paraphrase is an important control. If both generic rewriting and personal resampling destroy the signal equally, the result is simply "rewriting damages this watermark." If personal resampling behaves differently, that is the more interesting observation.
+
+Outputs:
+
+- `runs/watermark_benchmark.md` — compact aggregate and per-item comparison.
+- `runs/watermark_benchmark.json` — all source/control/personal texts, SynthID statistics, style scores, semantic checks, and ranked personal candidates.
+
+The headline columns are:
+
+```text
+plain detector statistic
+watermarked-before detector statistic
+generic-paraphrase-after detector statistic
+personal-resample-after detector statistic
+semantic preservation
+personal style delta
+```
+
+For a cheap smoke test before running the whole prompt set:
+
+```bash
+uv run paul-resampler watermark-generate \
+  --prompts experiments/prompts.example.jsonl \
+  --limit 2 \
+  --out runs/watermark_sources_smoke.jsonl
+
+uv run paul-resampler watermark-test \
+  --inputs runs/watermark_sources_smoke.jsonl \
+  --adapter adapters/paul \
+  -n 8 \
+  --out runs/watermark_smoke.md
+```
+
+### Interpretation warning
+
+The simple SynthID weighted-mean statistic is useful for comparing distributions under a fixed key/configuration, but a single raw score is not a universal detection probability. Google explicitly recommends calibration at the desired false-positive rate when using the Mean/Weighted Mean detector across lengths. If the first experiment is interesting, the next step is to collect enough plain/watermarked controls to calibrate score-vs-length before making claims about "watermark removed" or "watermark survives."
+
+## 5. Render a social-media demo from the saved results
+
+The renderer is deliberately downstream-only: it reads `watermark_benchmark.json` and **does not rerun any model, semantic gate, style scorer, or watermark detector**.
+
+Install the optional media dependencies:
+
+```bash
+uv sync --extra media
+```
+
+Then render a static 16:9 card plus an 8-second looping GIF and (when `ffmpeg` is available) MP4:
+
+```bash
+uv run python scripts/render_demo.py \
+  results/poc_v1/watermark_benchmark.json \
+  --out-dir media
+```
+
+The script auto-selects a semantically valid example with a strong watermark attenuation, or you can pin one:
+
+```bash
+uv run python scripts/render_demo.py \
+  results/poc_v1/watermark_benchmark.json \
+  --item mundane \
+  --out-dir media
+```
+
+The static card combines two views generated entirely from the recorded artifact:
+
+- **Rewrite search:** each personal-resampling candidate is plotted by lexical/surface rewrite distance from the watermarked source versus personal-style likelihood-ratio delta. Semantic failures are marked separately and the selected candidate is highlighted. Surface distance is intentionally labelled as such; it is not an embedding or semantic metric.
+- **Watermark attenuation:** aggregate plain, watermarked, generic-paraphrase and personal-resample weighted-mean SynthID statistics on the subset where both transformations passed the semantic gate. It also reports the fraction of watermark lift retained relative to the plain-generation baseline.
+
+The animation tells the same story for one example: source text → candidate cloud → semantic filtering → selected rewrite → before/after SynthID statistic. The renderer never receives anything beyond the saved benchmark JSON.

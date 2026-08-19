@@ -124,6 +124,7 @@ def generate_text(
     max_new_tokens: int = 500,
     seed: int | None = None,
     do_sample: bool = True,
+    watermarking_config=None,
 ) -> str:
     if seed is not None:
         torch.manual_seed(seed)
@@ -143,6 +144,8 @@ def generate_text(
     }
     if do_sample:
         generation_kwargs.update(temperature=temperature, top_p=top_p)
+    if watermarking_config is not None:
+        generation_kwargs["watermarking_config"] = watermarking_config
 
     with torch.inference_mode():
         output = model.generate(**inputs, **generation_kwargs)

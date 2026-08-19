@@ -1,0 +1,10 @@
+{"id":"detection","prompt":"Why should text-only AI detection become less reliable as language models improve? Explain the intuition without using equations."}
+{"id":"numerics","prompt":"Explain why Newton's method can behave chaotically even though it is usually taught as a root-finding algorithm."}
+{"id":"software","prompt":"Explain why composition can make testing a software system much harder even when every individual component is well tested."}
+{"id":"physics","prompt":"Explain the difference between heat and temperature to a technically literate reader."}
+{"id":"history","prompt":"Why did the telegraph change society in ways that were larger than simply sending messages faster?"}
+{"id":"mundane","prompt":"Explain why a kitchen knife often feels safer to use when it is sharp rather than blunt."}
+{"id":"argument","prompt":"Make the case that a small engineering team can sometimes outperform a much larger team on a narrowly defined technical problem."}
+{"id":"probability","prompt":"Explain regression to the mean using a sporting example without implying that it is a causal force."}
+{"id":"philosophy","prompt":"Why is it difficult to define intelligence with a single scalar measure?"}
+{"id":"email-ish","prompt":"Explain to a colleague why you want to run a small experiment before committing the team to a major architectural rewrite."}

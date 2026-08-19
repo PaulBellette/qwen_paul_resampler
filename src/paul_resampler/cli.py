@@ -7,6 +7,8 @@ from .calibrate import run_calibration
 from .rewrite import run_rewrite
 from .semantic import DEFAULT_NLI_MODEL
 from .train import train_style_adapter
+from .watermark import DEFAULT_SYNTHID_KEYS, SynthIDConfig, parse_keys, run_watermark_generate
+from .watermark_benchmark import run_watermark_test
 
 BASE_MODEL = "Qwen/Qwen3-0.6B-Base"
 GEN_MODEL = "Qwen/Qwen3-0.6B"
@@ -78,6 +80,47 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--max-chunks-per-group", "--samples", dest="max_chunks_per_group", type=int, default=None, help="Optional cap; samples unique chunks without replacement (legacy --samples alias supported)")
     cal.add_argument("--score-max-length", type=int, default=1024)
     cal.add_argument("--seed", type=int, default=2026)
+
+    wg = sub.add_parser("watermark-generate", help="Generate and freeze paired plain/SynthID source texts")
+    wg.add_argument("--prompts", required=True, help="JSONL/JSON prompt file with {id,prompt} records")
+    wg.add_argument("--out", default="runs/watermark_sources.jsonl")
+    wg.add_argument("--generator-model", default=GEN_MODEL)
+    wg.add_argument("--temperature", type=float, default=0.8)
+    wg.add_argument("--top-p", type=float, default=0.95)
+    wg.add_argument("--max-new-tokens", type=int, default=350)
+    wg.add_argument("--seed", type=int, default=4242)
+    wg.add_argument("--limit", type=int, default=None)
+    wg.add_argument("--overwrite", action="store_true", help="Deliberately replace an existing frozen source file")
+    wg.add_argument("--synthid-keys", default=",".join(str(x) for x in DEFAULT_SYNTHID_KEYS))
+    wg.add_argument("--synthid-ngram-len", type=int, default=5)
+    wg.add_argument("--synthid-sampling-table-size", type=int, default=2**16)
+    wg.add_argument("--synthid-sampling-table-seed", type=int, default=0)
+    wg.add_argument("--synthid-context-history-size", type=int, default=1024)
+    wg.add_argument("--synthid-skip-first-ngram-calls", action="store_true")
+
+    wt = sub.add_parser("watermark-test", help="Measure SynthID before/after generic paraphrase and personal resampling")
+    wt.add_argument("--inputs", required=True, help="Frozen JSONL produced by watermark-generate")
+    wt.add_argument("--adapter", default="adapters/paul")
+    wt.add_argument("--out", default="runs/watermark_benchmark.md")
+    wt.add_argument("--generator-model", default=GEN_MODEL)
+    wt.add_argument("--base-model", default=BASE_MODEL)
+    wt.add_argument("-n", type=int, default=16, help="Personal-resampling candidates per source")
+    wt.add_argument("--temperature", type=float, default=1.05)
+    wt.add_argument("--top-p", type=float, default=0.95)
+    wt.add_argument("--max-new-tokens", type=int, default=500)
+    wt.add_argument("--score-max-length", type=int, default=1024)
+    wt.add_argument("--seed", type=int, default=9000)
+    wt.add_argument("--limit", type=int, default=None)
+    wt.add_argument("--generic-attempts", type=int, default=4)
+    wt.add_argument("--generic-temperature", type=float, default=0.9)
+    wt.add_argument("--generic-top-p", type=float, default=0.95)
+    wt.add_argument("--nli-model", default=DEFAULT_NLI_MODEL)
+    wt.add_argument("--nli-device", default="auto")
+    wt.add_argument("--nli-entailment-threshold", type=float, default=0.50)
+    wt.add_argument("--nli-max-contradiction", type=float, default=0.20)
+    wt.add_argument("--nli-max-length", type=int, default=512)
+    wt.add_argument("--nli-source-coverage", type=float, default=1.0)
+    wt.add_argument("--nli-candidate-support", type=float, default=1.0)
     return p
 
 
@@ -131,6 +174,52 @@ def main():
             max_chunks_per_group=args.max_chunks_per_group,
             score_max_length=args.score_max_length,
             seed=args.seed,
+        )
+    elif args.command == "watermark-generate":
+        synthid = SynthIDConfig(
+            keys=parse_keys(args.synthid_keys),
+            ngram_len=args.synthid_ngram_len,
+            sampling_table_size=args.synthid_sampling_table_size,
+            sampling_table_seed=args.synthid_sampling_table_seed,
+            context_history_size=args.synthid_context_history_size,
+            skip_first_ngram_calls=args.synthid_skip_first_ngram_calls,
+        )
+        run_watermark_generate(
+            prompts_path=args.prompts,
+            output_path=args.out,
+            generator_model_name=args.generator_model,
+            synthid=synthid,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            seed=args.seed,
+            limit=args.limit,
+            overwrite=args.overwrite,
+        )
+    elif args.command == "watermark-test":
+        run_watermark_test(
+            inputs_path=args.inputs,
+            adapter_path=args.adapter,
+            output_path=args.out,
+            generator_model_name=args.generator_model,
+            base_model_name=args.base_model,
+            n=args.n,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            score_max_length=args.score_max_length,
+            seed=args.seed,
+            generic_attempts=args.generic_attempts,
+            generic_temperature=args.generic_temperature,
+            generic_top_p=args.generic_top_p,
+            nli_model_name=args.nli_model,
+            nli_device=args.nli_device,
+            nli_entailment_threshold=args.nli_entailment_threshold,
+            nli_max_contradiction=args.nli_max_contradiction,
+            nli_max_length=args.nli_max_length,
+            nli_source_coverage=args.nli_source_coverage,
+            nli_candidate_support=args.nli_candidate_support,
+            limit=args.limit,
         )
 
 
